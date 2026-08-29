@@ -1,0 +1,340 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const { OAuth2Client } = require('google-auth-library');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const multer = require('multer');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ==========================================
+// 1. CONFIGURATIONS
+// ==========================================
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: { folder: 'stylemonk_products', allowed_formats: ['jpg', 'png', 'jpeg', 'webp'] },
+});
+const upload = multer({ storage });
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+});
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// ==========================================
+// 2. DATABASE MODELS
+// ==========================================
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password: { type: String }, // Optional for Google Auth users
+  googleId: { type: String },
+  role: { type: String, enum: ['customer', 'admin'], default: 'customer' },
+}, { timestamps: true });
+const User = mongoose.model('User', userSchema);
+
+const otpSchema = new mongoose.Schema({
+  email: { type: String, required: true },
+  otp: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now, expires: 300 } // Expires in 5 mins
+});
+const OTP = mongoose.model('OTP', otpSchema);
+
+const productSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  description: { type: String, required: true },
+  category: { type: String, enum: ['Shirts', 'Trousers', 'Jackets', 'Accessories'], required: true },
+  price: { type: Number, required: true },
+  sizes: [{ type: String, enum: ['S', 'M', 'L', 'XL', 'XXL'] }],
+  colors: [{ type: String }],
+  images: [{ url: String, public_id: String }],
+  stock: { type: Number, required: true, default: 0 },
+}, { timestamps: true });
+const Product = mongoose.model('Product', productSchema);
+
+const cartSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  items: [{
+    product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+    quantity: { type: Number, default: 1 },
+    size: String,
+    color: String
+  }]
+}, { timestamps: true });
+const Cart = mongoose.model('Cart', cartSchema);
+
+const orderSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  orderItems: [{
+    product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+    name: String, quantity: Number, price: Number, size: String, color: String, image: String
+  }],
+  shippingAddress: { address: String, city: String, postalCode: String, country: String },
+  paymentMethod: { type: String, required: true },
+  paymentResult: { id: String, status: String, update_time: String, email_address: String },
+  totalPrice: { type: Number, required: true, default: 0.0 },
+  isPaid: { type: Boolean, required: true, default: false },
+  paidAt: { type: Date },
+  isDelivered: { type: Boolean, required: true, default: false },
+  deliveredAt: { type: Date },
+}, { timestamps: true });
+const Order = mongoose.model('Order', orderSchema);
+
+// ==========================================
+// 3. MIDDLEWARES
+// ==========================================
+const protect = async (req, res, next) => {
+  let token = req.headers.authorization?.startsWith('Bearer') ? req.headers.authorization.split(' ')[1] : null;
+  if (!token) return res.status(401).json({ message: 'Not authorized, no token' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select('-password');
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Not authorized, token failed' });
+  }
+};
+
+const admin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') next();
+  else res.status(401).json({ message: 'Not authorized as an admin' });
+};
+
+const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+// ==========================================
+// 4. AUTHENTICATION API
+// ==========================================
+// Send OTP
+app.post('/api/auth/send-otp', async (req, res) => {
+  const { email } = req.body;
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  await OTP.deleteMany({ email }); // Clear old OTPs
+  await OTP.create({ email, otp });
+  
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: 'Stylemonk Registration OTP',
+    text: `Your OTP for registration is ${otp}. It is valid for 5 minutes.`
+  });
+  res.json({ message: 'OTP sent to email' });
+});
+
+// Register with OTP
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password, otp } = req.body;
+  const validOtp = await OTP.findOne({ email, otp });
+  if (!validOtp) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+  const userExists = await User.findOne({ email });
+  if (userExists) return res.status(400).json({ message: 'User already exists' });
+
+  const salt = await bcrypt.genSalt(10);
+  const hashedPassword = await bcrypt.hash(password, salt);
+  const user = await User.create({ name, email, password: hashedPassword });
+  await OTP.deleteOne({ email }); // Cleanup
+  
+  res.status(201).json({ _id: user._id, name: user.name, email: user.email, token: generateToken(user._id) });
+});
+
+// Email/Password Login
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (user && user.password && (await bcrypt.compare(password, user.password))) {
+    res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
+  } else {
+    res.status(401).json({ message: 'Invalid email or password' });
+  }
+});
+
+// Google OAuth Login/Registration
+app.post('/api/auth/google', async (req, res) => {
+  const { tokenId } = req.body;
+  try {
+    const ticket = await googleClient.verifyIdToken({ idToken: tokenId, audience: process.env.GOOGLE_CLIENT_ID });
+    const { email, name, sub: googleId } = ticket.getPayload();
+    
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({ name, email, googleId });
+    }
+    res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
+  } catch (error) {
+    res.status(401).json({ message: 'Google authentication failed' });
+  }
+});
+
+// ==========================================
+// 5. PRODUCTS API
+// ==========================================
+// Get all products (with optional category filtering)
+app.get('/api/products', async (req, res) => {
+  const category = req.query.category ? { category: req.query.category } : {};
+  const products = await Product.find({ ...category });
+  res.json(products);
+});
+
+// Get single product
+app.get('/api/products/:id', async (req, res) => {
+  const product = await Product.findById(req.params.id);
+  product ? res.json(product) : res.status(404).json({ message: 'Product not found' });
+});
+
+// Create product (Admin only) - Handles Cloudinary multi-image upload
+app.post('/api/products', protect, admin, upload.array('images', 5), async (req, res) => {
+  const { name, description, category, price, sizes, colors, stock } = req.body;
+  const images = req.files.map(file => ({ url: file.path, public_id: file.filename }));
+  
+  const product = await Product.create({ 
+    name, description, category, price, stock,
+    sizes: sizes.split(','), colors: colors.split(','), images 
+  });
+  res.status(201).json(product);
+});
+
+// ==========================================
+// 6. CART API
+// ==========================================
+// Get User Cart
+app.get('/api/cart', protect, async (req, res) => {
+  let cart = await Cart.findOne({ user: req.user._id }).populate('items.product', 'name price images');
+  if (!cart) cart = await Cart.create({ user: req.user._id, items: [] });
+  res.json(cart);
+});
+
+// Add/Update item in cart
+app.post('/api/cart', protect, async (req, res) => {
+  const { productId, quantity, size, color } = req.body;
+  let cart = await Cart.findOne({ user: req.user._id });
+  if (!cart) cart = new Cart({ user: req.user._id, items: [] });
+
+  const itemIndex = cart.items.findIndex(i => i.product.toString() === productId && i.size === size && i.color === color);
+  if (itemIndex > -1) {
+    cart.items[itemIndex].quantity = quantity; // Update qty
+  } else {
+    cart.items.push({ product: productId, quantity, size, color });
+  }
+  await cart.save();
+  res.json(cart);
+});
+
+// Remove item from cart
+app.delete('/api/cart/:itemId', protect, async (req, res) => {
+  const cart = await Cart.findOne({ user: req.user._id });
+  if (cart) {
+    cart.items = cart.items.filter(item => item._id.toString() !== req.params.itemId);
+    await cart.save();
+    res.json(cart);
+  } else {
+    res.status(404).json({ message: 'Cart not found' });
+  }
+});
+
+// ==========================================
+// 7. ORDERS & TRANSACTIONS API
+// ==========================================
+// Place Order
+app.post('/api/orders', protect, async (req, res) => {
+  const { shippingAddress, paymentMethod } = req.body;
+  
+  const cart = await Cart.findOne({ user: req.user._id }).populate('items.product');
+  if (!cart || cart.items.length === 0) return res.status(400).json({ message: 'No items in cart' });
+
+  // Verify stock & Map items
+  let totalPrice = 0;
+  const orderItems = [];
+  for (let item of cart.items) {
+    if (item.product.stock < item.quantity) {
+      return res.status(400).json({ message: `${item.product.name} is out of stock` });
+    }
+    orderItems.push({
+      product: item.product._id,
+      name: item.product.name,
+      quantity: item.quantity,
+      price: item.product.price,
+      size: item.size,
+      color: item.color,
+      image: item.product.images[0]?.url
+    });
+    totalPrice += item.product.price * item.quantity;
+    // Decrease inventory
+    item.product.stock -= item.quantity;
+    await item.product.save();
+  }
+
+  const order = await Order.create({
+    user: req.user._id, orderItems, shippingAddress, paymentMethod, totalPrice
+  });
+
+  // Clear user cart
+  cart.items = [];
+  await cart.save();
+
+  res.status(201).json(order);
+});
+
+// Get User's Orders
+app.get('/api/orders/myorders', protect, async (req, res) => {
+  const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
+  res.json(orders);
+});
+
+// Process Payment (Webhook / Gateway callback simulation)
+app.put('/api/orders/:id/pay', protect, async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (order) {
+    order.isPaid = true;
+    order.paidAt = Date.now();
+    order.paymentResult = {
+      id: req.body.id,
+      status: req.body.status,
+      update_time: req.body.update_time,
+      email_address: req.body.email_address,
+    };
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
+  } else {
+    res.status(404).json({ message: 'Order not found' });
+  }
+});
+
+// Mark as Delivered (Admin only)
+app.put('/api/orders/:id/deliver', protect, admin, async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (order) {
+    order.isDelivered = true;
+    order.deliveredAt = Date.now();
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
+  } else {
+    res.status(404).json({ message: 'Order not found' });
+  }
+});
+
+// ==========================================
+// 8. SERVER INITIALIZATION
+// ==========================================
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => {
+    console.log('MongoDB Connected to Stylemonk DB');
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  })
+  .catch(err => console.error('MongoDB connection error:', err));
