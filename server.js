@@ -47,7 +47,7 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
-  password: { type: String }, // Optional for Google Auth users
+  password: { type: String },
   googleId: { type: String },
   role: { type: String, enum: ['customer', 'admin'], default: 'customer' },
 }, { timestamps: true });
@@ -56,7 +56,7 @@ const User = mongoose.model('User', userSchema);
 const otpSchema = new mongoose.Schema({
   email: { type: String, required: true },
   otp: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now, expires: 300 } // Expires in 5 mins
+  createdAt: { type: Date, default: Date.now, expires: 300 }
 });
 const OTP = mongoose.model('OTP', otpSchema);
 
@@ -101,13 +101,13 @@ const orderSchema = new mongoose.Schema({
 const Order = mongoose.model('Order', orderSchema);
 
 // ==========================================
-// 3. MIDDLEWARES
+// 3. MIDDLEWARES (Auth & Protection)
 // ==========================================
 const protect = async (req, res, next) => {
   let token = req.headers.authorization?.startsWith('Bearer') ? req.headers.authorization.split(' ')[1] : null;
   if (!token) return res.status(401).json({ message: 'Not authorized, no token' });
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
     req.user = await User.findById(decoded.id).select('-password');
     next();
   } catch (error) {
@@ -120,34 +120,30 @@ const admin = (req, res, next) => {
   else res.status(401).json({ message: 'Not authorized as an admin' });
 };
 
-const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET || 'fallback_secret', { expiresIn: '30d' });
+
+// Helper to wrap async routes to avoid unhandled promise rejections
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ==========================================
 // 4. AUTHENTICATION API
 // ==========================================
-// User Registration - Step 1: Send OTP
-app.post('/api/auth/send-otp', async (req, res) => {
+app.post('/api/auth/send-otp', asyncHandler(async (req, res) => {
   const { email } = req.body;
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  await OTP.deleteMany({ email }); // Clear old OTPs
+  await OTP.deleteMany({ email });
   await OTP.create({ email, otp });
 
-  try {
-    await transporter.sendMail({
-      from: "adepusanjay444@gmail.com",
-      to: email,
-      subject: 'Stylemonk OTP Verification',
-      text: `Your OTP is ${otp}. It is valid for 5 minutes.`
-    });
-    res.json({ message: 'OTP sent to email' });
-  } catch (error) {
-    console.error("Error sending email:", error);
-    res.status(500).json({ message: 'Failed to send OTP email', error: error.message });
-  }
-});
+  await transporter.sendMail({
+    from: "adepusanjay444@gmail.com",
+    to: email,
+    subject: 'Stylemonk OTP Verification',
+    text: `Your OTP is ${otp}. It is valid for 5 minutes.`
+  });
+  res.json({ message: 'OTP sent to email' });
+}));
 
-// User Registration - Step 2: Verify & Create Account
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', asyncHandler(async (req, res) => {
   const { name, email, password, otp } = req.body;
   const validOtp = await OTP.findOne({ email, otp });
   if (!validOtp) return res.status(400).json({ message: 'Invalid or expired OTP' });
@@ -158,40 +154,33 @@ app.post('/api/auth/register', async (req, res) => {
   const salt = await bcrypt.genSalt(10);
   const hashedPassword = await bcrypt.hash(password, salt);
   const user = await User.create({ name, email, password: hashedPassword });
-  await OTP.deleteOne({ email }); // Cleanup
+  await OTP.deleteOne({ email });
 
   res.status(201).json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
-});
+}));
 
-// Customer Login - Step 1: Verify Password & Send OTP
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', asyncHandler(async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
-  
+
   if (user && user.password && (await bcrypt.compare(password, user.password))) {
-    // Generate and send login OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await OTP.deleteMany({ email });
     await OTP.create({ email, otp });
 
-    try {
-      await transporter.sendMail({
-        from: "adepusanjay444@gmail.com",
-        to: email,
-        subject: 'Stylemonk Login Verification',
-        text: `Your login OTP is ${otp}. It is valid for 5 minutes.`
-      });
-      res.json({ message: 'Credentials valid. OTP sent to email for verification.', requiresOtp: true });
-    } catch (error) {
-      res.status(500).json({ message: 'Failed to send login OTP', error: error.message });
-    }
+    await transporter.sendMail({
+      from: "adepusanjay444@gmail.com",
+      to: email,
+      subject: 'Stylemonk Login Verification',
+      text: `Your login OTP is ${otp}. It is valid for 5 minutes.`
+    });
+    res.json({ message: 'Credentials valid. OTP sent to email for verification.', requiresOtp: true });
   } else {
     res.status(401).json({ message: 'Invalid email or password' });
   }
-});
+}));
 
-// Customer Login - Step 2: Verify OTP & Issue Token
-app.post('/api/auth/verify-login', async (req, res) => {
+app.post('/api/auth/verify-login', asyncHandler(async (req, res) => {
   const { email, otp } = req.body;
   const validOtp = await OTP.findOne({ email, otp });
   if (!validOtp) return res.status(400).json({ message: 'Invalid or expired OTP' });
@@ -199,15 +188,12 @@ app.post('/api/auth/verify-login', async (req, res) => {
   const user = await User.findOne({ email });
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  await OTP.deleteOne({ email }); // Cleanup
+  await OTP.deleteOne({ email });
   res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
-});
+}));
 
-// Admin Creation (Protected by a secret key)
-app.post('/api/auth/create-admin', async (req, res) => {
+app.post('/api/auth/create-admin', asyncHandler(async (req, res) => {
   const { name, email, password, adminSecret } = req.body;
-  
-  // Requires a secret phrase to prevent anyone from creating an admin account
   if (adminSecret !== (process.env.ADMIN_SECRET || 'stylemonk2024')) {
     return res.status(401).json({ message: 'Unauthorized: Invalid Admin Secret' });
   }
@@ -220,97 +206,86 @@ app.post('/api/auth/create-admin', async (req, res) => {
   const user = await User.create({ name, email, password: hashedPassword, role: 'admin' });
 
   res.status(201).json({ message: 'Admin created successfully', _id: user._id, email: user.email, role: user.role });
-});
+}));
 
-// Admin Login (Direct Login - Bypasses OTP for easier dashboard access)
-app.post('/api/auth/admin-login', async (req, res) => {
+app.post('/api/auth/admin-login', asyncHandler(async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
-  
+
   if (user && user.password && (await bcrypt.compare(password, user.password))) {
-    if (user.role !== 'admin') {
-      return res.status(403).json({ message: 'Access denied: You are not an admin.' });
-    }
-    // Issue token immediately without OTP
+    if (user.role !== 'admin') return res.status(403).json({ message: 'Access denied: You are not an admin.' });
     res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
   } else {
     res.status(401).json({ message: 'Invalid email or password' });
   }
-});
+}));
 
-// Google OAuth Login/Registration
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', asyncHandler(async (req, res) => {
   const { tokenId } = req.body;
-  try {
-    const ticket = await googleClient.verifyIdToken({ idToken: tokenId, audience: process.env.GOOGLE_CLIENT_ID });
-    const { email, name, sub: googleId } = ticket.getPayload();
+  const ticket = await googleClient.verifyIdToken({ idToken: tokenId, audience: process.env.GOOGLE_CLIENT_ID });
+  const { email, name, sub: googleId } = ticket.getPayload();
 
-    let user = await User.findOne({ email });
-    if (!user) {
-      user = await User.create({ name, email, googleId });
-    }
-    res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
-  } catch (error) {
-    res.status(401).json({ message: 'Google authentication failed' });
-  }
-});
+  let user = await User.findOne({ email });
+  if (!user) user = await User.create({ name, email, googleId });
+  
+  res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
+}));
 
 // ==========================================
 // 5. PRODUCTS API
 // ==========================================
-// Get all products (with optional category filtering)
-app.get('/api/products', async (req, res) => {
+app.get('/api/products', asyncHandler(async (req, res) => {
   const category = req.query.category ? { category: req.query.category } : {};
   const products = await Product.find({ ...category });
   res.json(products);
-});
+}));
 
-// Get single product
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', asyncHandler(async (req, res) => {
   const product = await Product.findById(req.params.id);
-  product ? res.json(product) : res.status(404).json({ message: 'Product not found' });
-});
+  if (product) res.json(product);
+  else res.status(404).json({ message: 'Product not found' });
+}));
 
-// Create product (Admin only) - Handles Cloudinary multi-image upload
-app.post('/api/products', protect, admin, upload.array('images', 5), async (req, res) => {
+app.post('/api/products', protect, admin, upload.array('images', 5), asyncHandler(async (req, res) => {
   const { name, description, category, price, sizes, colors, stock } = req.body;
-  const images = req.files.map(file => ({ url: file.path, public_id: file.filename }));
+  
+  // Safely parse arrays and map files to avoid crashes if body is malformed
+  const parsedSizes = sizes ? sizes.split(',') : [];
+  const parsedColors = colors ? colors.split(',') : [];
+  const images = req.files ? req.files.map(file => ({ url: file.path, public_id: file.filename })) : [];
 
   const product = await Product.create({ 
     name, description, category, price, stock,
-    sizes: sizes.split(','), colors: colors.split(','), images 
+    sizes: parsedSizes, colors: parsedColors, images 
   });
   res.status(201).json(product);
-});
+}));
 
 // ==========================================
 // 6. CART API
 // ==========================================
-// Get User Cart
-app.get('/api/cart', protect, async (req, res) => {
+app.get('/api/cart', protect, asyncHandler(async (req, res) => {
   let cart = await Cart.findOne({ user: req.user._id }).populate('items.product', 'name price images');
   if (!cart) cart = await Cart.create({ user: req.user._id, items: [] });
   res.json(cart);
-});
+}));
 
-// Add/Update item in cart
-app.post('/api/cart', protect, async (req, res) => {
+app.post('/api/cart', protect, asyncHandler(async (req, res) => {
   const { productId, quantity, size, color } = req.body;
   let cart = await Cart.findOne({ user: req.user._id });
   if (!cart) cart = new Cart({ user: req.user._id, items: [] });
 
   const itemIndex = cart.items.findIndex(i => i.product.toString() === productId && i.size === size && i.color === color);
   if (itemIndex > -1) {
-    cart.items[itemIndex].quantity = quantity; // Update qty
+    cart.items[itemIndex].quantity = quantity;
   } else {
     cart.items.push({ product: productId, quantity, size, color });
   }
   await cart.save();
   res.json(cart);
-});
+}));
 
-// Remove item from cart
-app.delete('/api/cart/:itemId', protect, async (req, res) => {
+app.delete('/api/cart/:itemId', protect, asyncHandler(async (req, res) => {
   const cart = await Cart.findOne({ user: req.user._id });
   if (cart) {
     cart.items = cart.items.filter(item => item._id.toString() !== req.params.itemId);
@@ -319,19 +294,17 @@ app.delete('/api/cart/:itemId', protect, async (req, res) => {
   } else {
     res.status(404).json({ message: 'Cart not found' });
   }
-});
+}));
 
 // ==========================================
-// 7. ORDERS & TRANSACTIONS API
+// 7. ORDERS API
 // ==========================================
-// Place Order
-app.post('/api/orders', protect, async (req, res) => {
+app.post('/api/orders', protect, asyncHandler(async (req, res) => {
   const { shippingAddress, paymentMethod } = req.body;
-
   const cart = await Cart.findOne({ user: req.user._id }).populate('items.product');
+  
   if (!cart || cart.items.length === 0) return res.status(400).json({ message: 'No items in cart' });
 
-  // Verify stock & Map items
   let totalPrice = 0;
   const orderItems = [];
   for (let item of cart.items) {
@@ -348,64 +321,45 @@ app.post('/api/orders', protect, async (req, res) => {
       image: item.product.images[0]?.url
     });
     totalPrice += item.product.price * item.quantity;
-    // Decrease inventory
     item.product.stock -= item.quantity;
     await item.product.save();
   }
 
-  const order = await Order.create({
-    user: req.user._id, orderItems, shippingAddress, paymentMethod, totalPrice
-  });
-
-  // Clear user cart
+  const order = await Order.create({ user: req.user._id, orderItems, shippingAddress, paymentMethod, totalPrice });
   cart.items = [];
   await cart.save();
-
   res.status(201).json(order);
-});
+}));
 
-// Get User's Orders
-app.get('/api/orders/myorders', protect, async (req, res) => {
+app.get('/api/orders/myorders', protect, asyncHandler(async (req, res) => {
   const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
   res.json(orders);
+}));
+
+// ==========================================
+// 8. ERROR HANDLING MIDDLEWARES
+// ==========================================
+// Catch 404 Requests
+app.use((req, res, next) => {
+  const error = new Error(`Route Not Found - ${req.originalUrl}`);
+  res.status(404);
+  next(error);
 });
 
-// Process Payment (Webhook / Gateway callback simulation)
-app.put('/api/orders/:id/pay', protect, async (req, res) => {
-  const order = await Order.findById(req.params.id);
-  if (order) {
-    order.isPaid = true;
-    order.paidAt = Date.now();
-    order.paymentResult = {
-      id: req.body.id,
-      status: req.body.status,
-      update_time: req.body.update_time,
-      email_address: req.body.email_address,
-    };
-    const updatedOrder = await order.save();
-    res.json(updatedOrder);
-  } else {
-    res.status(404).json({ message: 'Order not found' });
-  }
-});
-
-// Mark as Delivered (Admin only)
-app.put('/api/orders/:id/deliver', protect, admin, async (req, res) => {
-  const order = await Order.findById(req.params.id);
-  if (order) {
-    order.isDelivered = true;
-    order.deliveredAt = Date.now();
-    const updatedOrder = await order.save();
-    res.json(updatedOrder);
-  } else {
-    res.status(404).json({ message: 'Order not found' });
-  }
+// Global Error Handler
+app.use((err, req, res, next) => {
+  const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(statusCode);
+  res.json({
+    message: err.message,
+    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+  });
 });
 
 // ==========================================
-// 8. SERVER INITIALIZATION
+// 9. SERVER INITIALIZATION
 // ==========================================
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/stylemonk')
   .then(() => {
     console.log('MongoDB Connected to Stylemonk DB');
     const PORT = process.env.PORT || 5000;
