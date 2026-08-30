@@ -17,10 +17,11 @@ app.use(express.json());
 // ==========================================
 // 1. CONFIGURATIONS
 // ==========================================
+// Hardcoded Cloudinary configuration
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+  cloud_name: "dppiuypop",
+  api_key: "412712715735329",
+  api_secret: "m04IUY0-awwtr4YoS-1xvxOOIzU",
 });
 
 const storage = new CloudinaryStorage({
