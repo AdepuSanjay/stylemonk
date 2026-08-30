@@ -29,9 +29,13 @@ const storage = new CloudinaryStorage({
 });
 const upload = multer({ storage });
 
+// Hardcoded Nodemailer configuration
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+  service: "gmail",
+  auth: {
+    user: "adepusanjay444@gmail.com",
+    pass: "lrnesuqvssiognej", // App Password
+  }
 });
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -126,14 +130,19 @@ app.post('/api/auth/send-otp', async (req, res) => {
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
   await OTP.deleteMany({ email }); // Clear old OTPs
   await OTP.create({ email, otp });
-  
-  await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: email,
-    subject: 'Stylemonk Registration OTP',
-    text: `Your OTP for registration is ${otp}. It is valid for 5 minutes.`
-  });
-  res.json({ message: 'OTP sent to email' });
+
+  try {
+    await transporter.sendMail({
+      from: "adepusanjay444@gmail.com",
+      to: email,
+      subject: 'Stylemonk Registration OTP',
+      text: `Your OTP for registration is ${otp}. It is valid for 5 minutes.`
+    });
+    res.json({ message: 'OTP sent to email' });
+  } catch (error) {
+    console.error("Error sending email:", error);
+    res.status(500).json({ message: 'Failed to send OTP email', error: error.message });
+  }
 });
 
 // Register with OTP
@@ -149,7 +158,7 @@ app.post('/api/auth/register', async (req, res) => {
   const hashedPassword = await bcrypt.hash(password, salt);
   const user = await User.create({ name, email, password: hashedPassword });
   await OTP.deleteOne({ email }); // Cleanup
-  
+
   res.status(201).json({ _id: user._id, name: user.name, email: user.email, token: generateToken(user._id) });
 });
 
@@ -170,7 +179,7 @@ app.post('/api/auth/google', async (req, res) => {
   try {
     const ticket = await googleClient.verifyIdToken({ idToken: tokenId, audience: process.env.GOOGLE_CLIENT_ID });
     const { email, name, sub: googleId } = ticket.getPayload();
-    
+
     let user = await User.findOne({ email });
     if (!user) {
       user = await User.create({ name, email, googleId });
@@ -201,7 +210,7 @@ app.get('/api/products/:id', async (req, res) => {
 app.post('/api/products', protect, admin, upload.array('images', 5), async (req, res) => {
   const { name, description, category, price, sizes, colors, stock } = req.body;
   const images = req.files.map(file => ({ url: file.path, public_id: file.filename }));
-  
+
   const product = await Product.create({ 
     name, description, category, price, stock,
     sizes: sizes.split(','), colors: colors.split(','), images 
@@ -253,7 +262,7 @@ app.delete('/api/cart/:itemId', protect, async (req, res) => {
 // Place Order
 app.post('/api/orders', protect, async (req, res) => {
   const { shippingAddress, paymentMethod } = req.body;
-  
+
   const cart = await Cart.findOne({ user: req.user._id }).populate('items.product');
   if (!cart || cart.items.length === 0) return res.status(400).json({ message: 'No items in cart' });
 
