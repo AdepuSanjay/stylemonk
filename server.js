@@ -124,7 +124,7 @@ const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expires
 // ==========================================
 // 4. AUTHENTICATION API
 // ==========================================
-// Send OTP
+// User Registration - Step 1: Send OTP
 app.post('/api/auth/send-otp', async (req, res) => {
   const { email } = req.body;
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -135,8 +135,8 @@ app.post('/api/auth/send-otp', async (req, res) => {
     await transporter.sendMail({
       from: "adepusanjay444@gmail.com",
       to: email,
-      subject: 'Stylemonk Registration OTP',
-      text: `Your OTP for registration is ${otp}. It is valid for 5 minutes.`
+      subject: 'Stylemonk OTP Verification',
+      text: `Your OTP is ${otp}. It is valid for 5 minutes.`
     });
     res.json({ message: 'OTP sent to email' });
   } catch (error) {
@@ -145,7 +145,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
   }
 });
 
-// Register with OTP
+// User Registration - Step 2: Verify & Create Account
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, password, otp } = req.body;
   const validOtp = await OTP.findOne({ email, otp });
@@ -159,14 +159,78 @@ app.post('/api/auth/register', async (req, res) => {
   const user = await User.create({ name, email, password: hashedPassword });
   await OTP.deleteOne({ email }); // Cleanup
 
-  res.status(201).json({ _id: user._id, name: user.name, email: user.email, token: generateToken(user._id) });
+  res.status(201).json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
 });
 
-// Email/Password Login
+// Customer Login - Step 1: Verify Password & Send OTP
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
+  
   if (user && user.password && (await bcrypt.compare(password, user.password))) {
+    // Generate and send login OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await OTP.deleteMany({ email });
+    await OTP.create({ email, otp });
+
+    try {
+      await transporter.sendMail({
+        from: "adepusanjay444@gmail.com",
+        to: email,
+        subject: 'Stylemonk Login Verification',
+        text: `Your login OTP is ${otp}. It is valid for 5 minutes.`
+      });
+      res.json({ message: 'Credentials valid. OTP sent to email for verification.', requiresOtp: true });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to send login OTP', error: error.message });
+    }
+  } else {
+    res.status(401).json({ message: 'Invalid email or password' });
+  }
+});
+
+// Customer Login - Step 2: Verify OTP & Issue Token
+app.post('/api/auth/verify-login', async (req, res) => {
+  const { email, otp } = req.body;
+  const validOtp = await OTP.findOne({ email, otp });
+  if (!validOtp) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+  const user = await User.findOne({ email });
+  if (!user) return res.status(404).json({ message: 'User not found' });
+
+  await OTP.deleteOne({ email }); // Cleanup
+  res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
+});
+
+// Admin Creation (Protected by a secret key)
+app.post('/api/auth/create-admin', async (req, res) => {
+  const { name, email, password, adminSecret } = req.body;
+  
+  // Requires a secret phrase to prevent anyone from creating an admin account
+  if (adminSecret !== (process.env.ADMIN_SECRET || 'stylemonk2024')) {
+    return res.status(401).json({ message: 'Unauthorized: Invalid Admin Secret' });
+  }
+
+  const userExists = await User.findOne({ email });
+  if (userExists) return res.status(400).json({ message: 'User already exists' });
+
+  const salt = await bcrypt.genSalt(10);
+  const hashedPassword = await bcrypt.hash(password, salt);
+  const user = await User.create({ name, email, password: hashedPassword, role: 'admin' });
+
+  res.status(201).json({ message: 'Admin created successfully', _id: user._id, email: user.email, role: user.role });
+});
+
+// Admin Login (Direct Login - Bypasses OTP for easier dashboard access)
+app.post('/api/auth/admin-login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  
+  if (user && user.password && (await bcrypt.compare(password, user.password))) {
+    if (user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied: You are not an admin.' });
+    }
+    // Issue token immediately without OTP
     res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
   } else {
     res.status(401).json({ message: 'Invalid email or password' });
