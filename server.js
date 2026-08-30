@@ -366,3 +366,4 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/stylemonk')
     app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
   .catch(err => console.error('MongoDB connection error:', err));
+ 
