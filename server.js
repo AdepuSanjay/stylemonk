@@ -9,6 +9,8 @@ const { OAuth2Client } = require('google-auth-library');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const multer = require('multer');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -40,6 +42,12 @@ const transporter = nodemailer.createTransport({
 });
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// Razorpay Configuration
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_YOUR_KEY_HERE',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE',
+});
 
 // ==========================================
 // 2. DATABASE MODELS
@@ -122,7 +130,6 @@ const admin = (req, res, next) => {
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET || 'fallback_secret', { expiresIn: '30d' });
 
-// Helper to wrap async routes to avoid unhandled promise rejections
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ==========================================
@@ -227,7 +234,7 @@ app.post('/api/auth/google', asyncHandler(async (req, res) => {
 
   let user = await User.findOne({ email });
   if (!user) user = await User.create({ name, email, googleId });
-  
+
   res.json({ _id: user._id, name: user.name, email: user.email, role: user.role, token: generateToken(user._id) });
 }));
 
@@ -248,8 +255,7 @@ app.get('/api/products/:id', asyncHandler(async (req, res) => {
 
 app.post('/api/products', protect, admin, upload.array('images', 5), asyncHandler(async (req, res) => {
   const { name, description, category, price, sizes, colors, stock } = req.body;
-  
-  // Safely parse arrays and map files to avoid crashes if body is malformed
+
   const parsedSizes = sizes ? sizes.split(',') : [];
   const parsedColors = colors ? colors.split(',') : [];
   const images = req.files ? req.files.map(file => ({ url: file.path, public_id: file.filename })) : [];
@@ -297,12 +303,12 @@ app.delete('/api/cart/:itemId', protect, asyncHandler(async (req, res) => {
 }));
 
 // ==========================================
-// 7. ORDERS API
+// 7. ORDERS API (Including Razorpay)
 // ==========================================
 app.post('/api/orders', protect, asyncHandler(async (req, res) => {
   const { shippingAddress, paymentMethod } = req.body;
   const cart = await Cart.findOne({ user: req.user._id }).populate('items.product');
-  
+
   if (!cart || cart.items.length === 0) return res.status(400).json({ message: 'No items in cart' });
 
   let totalPrice = 0;
@@ -336,17 +342,57 @@ app.get('/api/orders/myorders', protect, asyncHandler(async (req, res) => {
   res.json(orders);
 }));
 
+// Generate Razorpay Order
+app.post('/api/orders/:id/razorpay', protect, asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return res.status(404).json({ message: 'Order not found' });
+
+  const options = {
+    amount: Math.round(order.totalPrice * 100), // Razorpay works in smallest currency unit (paise)
+    currency: "INR",
+    receipt: `receipt_${order._id}`,
+  };
+
+  const razorpayOrder = await razorpay.orders.create(options);
+  res.json(razorpayOrder);
+}));
+
+// Verify Razorpay Payment Signature
+app.post('/api/orders/:id/verify-razorpay', protect, asyncHandler(async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+  const body = razorpay_order_id + "|" + razorpay_payment_id;
+  const expectedSignature = crypto
+    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE')
+    .update(body.toString())
+    .digest("hex");
+
+  if (expectedSignature === razorpay_signature) {
+    const order = await Order.findById(req.params.id);
+    order.isPaid = true;
+    order.paidAt = Date.now();
+    order.paymentResult = {
+      id: razorpay_payment_id,
+      status: 'COMPLETED',
+      update_time: new Date().toISOString(),
+      email_address: req.user.email,
+    };
+    await order.save();
+    res.json({ message: "Payment verified successfully", order });
+  } else {
+    res.status(400).json({ message: "Invalid signature" });
+  }
+}));
+
 // ==========================================
 // 8. ERROR HANDLING MIDDLEWARES
 // ==========================================
-// Catch 404 Requests
 app.use((req, res, next) => {
   const error = new Error(`Route Not Found - ${req.originalUrl}`);
   res.status(404);
   next(error);
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
   res.status(statusCode);
@@ -366,4 +412,3 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/stylemonk')
     app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
   .catch(err => console.error('MongoDB connection error:', err));
- 
