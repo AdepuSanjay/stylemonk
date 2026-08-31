@@ -43,10 +43,10 @@ const transporter = nodemailer.createTransport({
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// Razorpay Configuration
+// Hardcoded Razorpay Configuration
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_YOUR_KEY_HERE',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE',
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_TWP081g2mT37R2',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'C77Zqzg7ljJ6lVmlu4wXdCnP',
 });
 
 // ==========================================
@@ -363,7 +363,7 @@ app.post('/api/orders/:id/verify-razorpay', protect, asyncHandler(async (req, re
 
   const body = razorpay_order_id + "|" + razorpay_payment_id;
   const expectedSignature = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE')
+    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || 'C77Zqzg7ljJ6lVmlu4wXdCnP')
     .update(body.toString())
     .digest("hex");
 
